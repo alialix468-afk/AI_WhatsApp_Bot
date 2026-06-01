@@ -3,7 +3,7 @@ const pino = require('pino');
 const axios = require('axios');
 
 // رقمك مضاف هنا كما طلبت
-const MY_PHONE_NUMBER = "967783297002"; 
+const MY_PHONE_NUMBER = "967737789790"; 
 
 async function connectToWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
