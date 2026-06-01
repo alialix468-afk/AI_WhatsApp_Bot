@@ -15,7 +15,7 @@ app = FastAPI()
 # تشغيل بوت الواتساب في الخلفية
 def run_bot():
     try:
-        subprocess.Popen(["node", "whatsapp_service/index.js"])
+        subprocess.Popen(["nodejs", "whatsapp_service/index.js"])
     except Exception as e:
         print(f"Error starting bot: {e}")
 
