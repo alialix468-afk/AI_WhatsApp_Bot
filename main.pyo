@@ -1,0 +1,294 @@
+from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form, Depends, status
+from PIL import Image
+from pydantic import BaseModel
+from typing import Optional
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from datetime import datetime, timedelta
+
+from database.models import User, Message, Setting, Statistic, create_db_and_tables
+from database.__init__ import get_db
+from sqlalchemy.orm import Session as SQLAlchemySession
+from services.gemini import GeminiService
+from services.voice import VoiceService
+from services.memory import MemoryService
+from services.personality import PersonalityService
+from services.security import AntiSpamService
+import httpx
+import aiofiles
+import os
+
+# Security settings
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/dashboard/token")
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    username: Optional[str] = None
+
+class UserInDB(User):
+    hashed_password: str = ""
+
+async def get_user_from_db(db: SQLAlchemySession, username: str):
+    # For now, we'll assume the username is the whatsapp_id for admin user
+    if username == "admin":
+        user = db.query(User).filter(User.whatsapp_id == "admin").first()
+        if not user:
+            # Create a default admin user if not exists
+            hashed_password = get_password_hash("adminpass") # Default admin password
+            user = User(whatsapp_id="admin", name="Admin User")
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+            # Store hashed password in a setting for the admin user
+            admin_setting = Setting(user_id=user.id, key="hashed_password", value=hashed_password)
+            db.add(admin_setting)
+            db.commit()
+            db.refresh(admin_setting)
+        else:
+            hashed_password = db.query(Setting).filter(Setting.user_id == user.id, Setting.key == "hashed_password").first()
+            if hashed_password:
+                hashed_password = hashed_password.value
+            else:
+                hashed_password = get_password_hash("adminpass") # Default admin password if not set
+                admin_setting = Setting(user_id=user.id, key="hashed_password", value=hashed_password)
+                db.add(admin_setting)
+                db.commit()
+                db.refresh(admin_setting)
+        return UserInDB(id=user.id, whatsapp_id=user.whatsapp_id, name=user.name, created_at=user.created_at, updated_at=user.updated_at, is_blocked=user.is_blocked, current_personality=user.current_personality, hashed_password=hashed_password)
+    return None
+
+async def authenticate_user(db: SQLAlchemySession, username: str, password: str):
+    user = await get_user_from_db(db, username)
+    if not user:
+        return False
+    if not verify_password(password, user.hashed_password):
+        return False
+    return user
+
+async def get_current_user(db: SQLAlchemySession = Depends(get_db), token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+        token_data = TokenData(username=username)
+    except JWTError:
+        raise credentials_exception
+    user = await get_user_from_db(db, token_data.username)
+    if user is None:
+        raise credentials_exception
+    return user
+
+app = FastAPI()
+gemini_service = GeminiService()
+voice_service = VoiceService()
+memory_service = MemoryService()
+personality_service = PersonalityService()
+anti_spam_service = AntiSpamService()
+
+# Create database tables on startup
+@app.on_event("startup")
+def on_startup():
+    create_db_and_tables()
+
+# Placeholder for Baileys service URL
+BAILEYS_SERVICE_URL = os.getenv("BAILEYS_SERVICE_URL", "http://localhost:3000")
+
+class Message(BaseModel):
+    sender: str
+    text: str
+
+@app.get("/")
+async def read_root():
+    return {"message": "AI WhatsApp Assistant FastAPI Backend"}
+
+@app.post("/token", response_model=Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: SQLAlchemySession = Depends(get_db)):
+    user = await authenticate_user(db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post("/webhook/whatsapp")
+async def whatsapp_webhook(request: Request, db: SQLAlchemySession = Depends(get_db)):
+    body = await request.json()
+    print("Received webhook from Baileys:", body)
+
+    whatsapp_id = body.get("remoteJid") or body.get("phoneNumber")
+    user = db.query(User).filter(User.whatsapp_id == whatsapp_id).first()
+    if not user:
+        user = User(whatsapp_id=whatsapp_id)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    if body.get("type") == "pairing_code":
+        pairing_code = body.get("code")
+        phone_number = body.get("phoneNumber")
+        print(f"Received pairing code: {pairing_code} for phone number: {phone_number}")
+        # Here you would typically store this pairing code and display it to the user
+        # For now, we just print it.
+    elif body.get("type") == "image_message":
+        remote_jid = body.get("remoteJid")
+        if remote_jid and anti_spam_service.is_spam(remote_jid):
+            print(f"Spam detected from {remote_jid}. Ignoring message.")
+            return {"status": "spam_ignored"}
+        image_path = body.get("imagePath")
+        if image_path and remote_jid:
+            print(f"Received image message from {remote_jid} at {image_path}")
+            memory_service.add_message(db, user.id, "user", "صورة", "image")
+            try:
+                current_personality_prompt = personality_service.get_personality_prompt(memory_service.get_preference(db, user.id, "personality", "friendly"))
+                gemini_response = await gemini_service.generate_response("صف لي هذه الصورة", personality_prompt=current_personality_prompt, image_path=image_path)
+                memory_service.add_message(db, user.id, "bot", gemini_response, "image")
+                print(f"Gemini Vision response: {gemini_response}")
+                os.remove(image_path) # Clean up temporary image file
+
+                async with httpx.AsyncClient() as client:
+                    await client.post(f"{BAILEYS_SERVICE_URL}/send", json={
+                        "to": remote_jid,
+                        "text": gemini_response
+                    })
+            except Exception as e:
+                print(f"Error processing image message: {e}")
+                async with httpx.AsyncClient() as client:
+                    await client.post(f"{BAILEYS_SERVICE_URL}/send", json={
+                        "to": remote_jid,
+                        "text": "عذرًا، حدث خطأ أثناء معالجة رسالتك المصورة."
+                    })
+    elif body.get("type") == "audio_message":
+        remote_jid = body.get("remoteJid")
+        if remote_jid and anti_spam_service.is_spam(remote_jid):
+            print(f"Spam detected from {remote_jid}. Ignoring message.")
+            return {"status": "spam_ignored"}
+        audio_path = body.get("audioPath")
+        if audio_path and remote_jid:
+            print(f"Received audio message from {remote_jid} at {audio_path}")
+            memory_service.add_message(db, user.id, "user", "رسالة صوتية", "audio")
+            try:
+                transcribed_text = await voice_service.transcribe_audio(audio_path)
+                print(f"Transcribed text: {transcribed_text}")
+                os.remove(audio_path) # Clean up temporary audio file
+
+                if transcribed_text:
+                    memory_service.add_message(db, user.id, "user", transcribed_text, "audio")
+
+                    current_personality_prompt = personality_service.get_personality_prompt(memory_service.get_preference(db, user.id, "personality", "friendly"))
+                    gemini_response = await gemini_service.generate_response(transcribed_text, personality_prompt=current_personality_prompt)
+                    memory_service.add_message(db, user.id, "bot", gemini_response, "audio")
+                    print(f"Gemini response: {gemini_response}")
+
+                    audio_response_bytes = await voice_service.text_to_speech(gemini_response)
+
+                    audio_response_path = f"./temp_response_{remote_jid}.mp3"
+                    async with aiofiles.open(audio_response_path, "wb") as out_file:
+                        await out_file.write(audio_response_bytes)
+
+                    async with httpx.AsyncClient() as client:
+                        with open(audio_response_path, "rb") as f:
+                            files = {"audio": (audio_response_path, f.read(), "audio/mp3")}
+                            data = {"to": remote_jid}
+                            await client.post(f"{BAILEYS_SERVICE_URL}/send_audio", files=files, data=data)
+                    os.remove(audio_response_path) # Clean up temporary audio response file
+
+            except Exception as e:
+                print(f"Error processing audio message: {e}")
+                async with httpx.AsyncClient() as client:
+                    await client.post(f"{BAILEYS_SERVICE_URL}/send", json={
+                        "to": remote_jid,
+                        "text": "عذرًا، حدث خطأ أثناء معالجة رسالتك الصوتية."
+                    })
+
+    elif body.get("type") == "text_message":
+        message_data = body.get("message")
+        remote_jid = message_data.get("key", {}).get("remoteJid")
+        if remote_jid and anti_spam_service.is_spam(remote_jid):
+            print(f"Spam detected from {remote_jid}. Ignoring message.")
+            return {"status": "spam_ignored"}
+        print("Incoming WhatsApp message:", message_data)
+        message_text = message_data.get("message", {}).get("conversation")
+
+        if message_text and remote_jid:
+            memory_service.add_message(db, user.id, "user", message_text, "text")
+
+            current_personality_prompt = personality_service.get_personality_prompt(memory_service.get_preference(db, user.id, "personality", "friendly"))
+            gemini_response = await gemini_service.generate_response(message_text, personality_prompt=current_personality_prompt)
+            memory_service.add_message(db, user.id, "bot", gemini_response, "text")
+            
+            try:
+                async with httpx.AsyncClient() as client:
+                    await client.post(f"{BAILEYS_SERVICE_URL}/send", json={
+                        "to": remote_jid,
+                        "text": gemini_response
+                    })
+            except httpx.RequestError as exc:
+                print(f"Error sending message back to WhatsApp: {exc}")
+            except httpx.HTTPStatusError as exc:
+                print(f"Error from Baileys service when sending message back: {exc.response.text}")
+
+    return {"status": "received"}
+
+@app.post("/send_message")
+async def send_message(message: Message):
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(f"{BAILEYS_SERVICE_URL}/send", json=message.dict())
+            response.raise_for_status()
+            return response.json()
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=500, detail=f"Error communicating with Baileys service: {exc}")
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=exc.response.status_code, detail=f"Error from Baileys service: {exc.response.text}")
+
+@app.post("/send_audio")
+async def send_audio(to: str = Form(...), audio: UploadFile = File(...)):
+    try:
+        audio_content = await audio.read()
+        print(f"Received audio to send to {to} with filename {audio.filename}")
+        async with httpx.AsyncClient() as client:
+            await client.post(f"{BAILEYS_SERVICE_URL}/send", json={
+                "to": to,
+                "text": "تم استلام رسالتك الصوتية، ولكن لا يمكنني إرسال الرد الصوتي حاليًا."
+            })
+        return {"status": "audio received for sending"}
+    except Exception as e:
+        print(f"Error in send_audio endpoint: {e}")
+        raise HTTPException(status_code=500, detail=f"Error processing audio for sending: {e}")

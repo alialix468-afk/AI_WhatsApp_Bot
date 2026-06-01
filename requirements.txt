@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+python-dotenv
+SQLAlchemy
+asyncpg  # For PostgreSQL support
+python-multipart
+httpx
+python-jose[jwt]
+pymongo # Placeholder, will be replaced by actual ORM for SQLite/PostgreSQL
+gTTS
+aiofiles
+Pillow
+jinja2
+psycopg2-binary
+python-jose[cryptography]
+passlib[bcrypt]
