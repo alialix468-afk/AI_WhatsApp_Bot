@@ -1,3 +1,4 @@
+let isPairingRequested = false;
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const axios = require('axios');
@@ -24,7 +25,15 @@ async function connectToWhatsApp() {
         setTimeout(async () => {
             try {
                 const phoneNumber = MY_PHONE_NUMBER.replace(/[^0-9]/g, '');
-                const code = await sock.requestPairingCode(phoneNumber);
+        isPairingRequested = true;
+        console.log("جارٍ طلب كود الربط...");
+        try {
+            const code = await sock.requestPairingCode("967783297002");
+            console.log("✅ كود الربط الخاص بك هو: " + code);
+        } catch (error) {
+            console.error("خطأ أثناء طلب الكود:", error);
+            isPairingRequested = false;
+        }
                 console.log("------------------------------------------");
                 console.log("✅ كود الربط الخاص بك هو: " + code);
                 console.log("------------------------------------------");
