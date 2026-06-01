@@ -1,3 +1,6 @@
+import subprocess
+import threading
+import os
 import os
 import base64
 import requests
@@ -8,6 +11,16 @@ from fastapi.responses import JSONResponse
 GROQ_API_KEY = os.environ.get("")
 
 app = FastAPI()
+
+# تشغيل بوت الواتساب في الخلفية
+def run_bot():
+    try:
+        subprocess.Popen(["node", "whatsapp_service/index.js"])
+    except Exception as e:
+        print(f"Error starting bot: {e}")
+
+# تشغيل البوت عند بدء تشغيل التطبيق
+threading.Thread(target=run_bot, daemon=True).start()
 
 # 🧠 نظام الشخصية (المعدل بالتعليمات الدقيقة)
 SYSTEM_PROMPT = """
